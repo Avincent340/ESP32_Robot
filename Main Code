@@ -1,0 +1,760 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiUdp.h>
+
+// ===================== PIN DEFINITIONS =====================
+static const int PIN_RMOTOR_1A = 18;
+static const int PIN_RMOTOR_2A = 19;
+static const int PIN_LMOTOR_3A = 16;
+static const int PIN_LMOTOR_4A = 17;
+
+static const int PIN_RPWM_EN  = 26;
+static const int PIN_LPWM_EN  = 25;
+
+static const int PIN_LINE_ADC = 32;
+static const int PIN_TRIG     = 4;
+static const int PIN_ECHO     = 27;
+
+WebServer server(80);
+WiFiUDP udp;
+
+// ===================== WIFI =====================
+const char* AP_SSID = "ESP32-NOMAD";
+const char* AP_PASS = "nomad1234";
+
+// Dual-mode STA network from the provided activity PDF
+const char* STA_SSID = "SU-ECE-LAB";
+const char* STA_PASS = "FaraDay8086!";
+#define UDP_PORT 4210
+char incomingPacket[255];
+int robotID = 21;
+
+// ===================== MOTOR ORIENTATION =====================
+// These values match the common orientation where the right motor must run
+// opposite polarity from the left motor for straight forward motion.
+static const int RIGHT_FWD_DIR = -1;
+static const int LEFT_FWD_DIR  = +1;
+
+// ===================== MODES =====================
+enum Mode { MODE_AUTO, MODE_MANUAL, MODE_DANCE };
+volatile Mode mode = MODE_MANUAL;
+
+// ===================== SPEEDS =====================
+int baseSpeed = 175;
+int turnSpeed = 195;
+int searchSpeed = 185;
+int backSpeed = 165;
+
+// Motor trim for straight motion
+int leftTrim  = 0;
+int rightTrim = 0;
+
+// ===================== LINE CALIBRATION =====================
+int whiteRef = -1;
+int blackRef = -1;
+int lineThreshold = 2000;
+bool lineInvert = false;
+int hysteresis = 140;
+int thrLow = 1930;
+int thrHigh = 2070;
+bool lineStateBlack = false;
+
+// ===================== LINE FOLLOW MEMORY =====================
+// With a single analog line sensor, the robot cannot directly know left vs right
+// when it is completely off the line, so we store the last successful recovery
+// direction and search aggressively in that direction first, then alternate.
+int lastTurnDir = 0;                   // -1 left, +1 right, 0 unknown
+unsigned long lastSeenLineMs = 0;
+unsigned long lineLostStartMs = 0;
+unsigned long lastRecoveryFlipMs = 0;
+int recoveryDir = -1;
+
+// ===================== OBSTACLE =====================
+int obstacleStopCm = 18;
+int obstacleClearCm = 24;
+bool avoiding = false;
+unsigned long avoidMs = 0;
+
+// ===================== DANCE =====================
+bool danceActive = false;
+unsigned long danceStartMs = 0;
+int danceStep = 0;
+
+// ===================== HELPERS =====================
+static int sampleLineADC(int samples = 80, int delayMs = 3) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(PIN_LINE_ADC);
+    delay(delayMs);
+  }
+  return (int)(sum / samples);
+}
+
+static inline void setMotorRight(int dir, int pwm) {
+  if (dir > 0) {
+    digitalWrite(PIN_RMOTOR_1A, HIGH);
+    digitalWrite(PIN_RMOTOR_2A, LOW);
+  } else if (dir < 0) {
+    digitalWrite(PIN_RMOTOR_1A, LOW);
+    digitalWrite(PIN_RMOTOR_2A, HIGH);
+  } else {
+    digitalWrite(PIN_RMOTOR_1A, LOW);
+    digitalWrite(PIN_RMOTOR_2A, LOW);
+  }
+  analogWrite(PIN_RPWM_EN, constrain(pwm, 0, 255));
+}
+
+static inline void setMotorLeft(int dir, int pwm) {
+  if (dir > 0) {
+    digitalWrite(PIN_LMOTOR_3A, HIGH);
+    digitalWrite(PIN_LMOTOR_4A, LOW);
+  } else if (dir < 0) {
+    digitalWrite(PIN_LMOTOR_3A, LOW);
+    digitalWrite(PIN_LMOTOR_4A, HIGH);
+  } else {
+    digitalWrite(PIN_LMOTOR_3A, LOW);
+    digitalWrite(PIN_LMOTOR_4A, LOW);
+  }
+  analogWrite(PIN_LPWM_EN, constrain(pwm, 0, 255));
+}
+
+static inline int applyLeftTrim(int pwm) {
+  return constrain(pwm + leftTrim, 0, 255);
+}
+
+static inline int applyRightTrim(int pwm) {
+  return constrain(pwm + rightTrim, 0, 255);
+}
+
+static inline void driveRaw(int rightDir, int rightPwm, int leftDir, int leftPwm) {
+  setMotorRight(rightDir, applyRightTrim(rightPwm));
+  setMotorLeft(leftDir, applyLeftTrim(leftPwm));
+}
+
+static inline void driveStop() {
+  driveRaw(0, 0, 0, 0);
+}
+
+static inline void driveForward(int spd) {
+  driveRaw(RIGHT_FWD_DIR, spd, LEFT_FWD_DIR, spd);
+}
+
+static inline void driveBackward(int spd) {
+  driveRaw(-RIGHT_FWD_DIR, spd, -LEFT_FWD_DIR, spd);
+}
+
+static inline void driveForwardBiasLeft(int fastPwm, int slowPwm) {
+  // biases robot left while still moving forward
+  driveRaw(RIGHT_FWD_DIR, fastPwm, LEFT_FWD_DIR, slowPwm);
+  lastTurnDir = -1;
+}
+
+static inline void driveForwardBiasRight(int fastPwm, int slowPwm) {
+  // biases robot right while still moving forward
+  driveRaw(RIGHT_FWD_DIR, slowPwm, LEFT_FWD_DIR, fastPwm);
+  lastTurnDir = +1;
+}
+
+static inline void turnLeft(int spd) {
+  // pivot left in place
+  driveRaw(-RIGHT_FWD_DIR, spd, LEFT_FWD_DIR, spd);
+  lastTurnDir = -1;
+}
+
+static inline void turnRight(int spd) {
+  // pivot right in place
+  driveRaw(RIGHT_FWD_DIR, spd, -LEFT_FWD_DIR, spd);
+  lastTurnDir = +1;
+}
+
+static inline int readLineRaw() {
+  return analogRead(PIN_LINE_ADC);
+}
+
+static void updateThresholds() {
+  thrLow = constrain(lineThreshold - hysteresis / 2, 0, 4095);
+  thrHigh = constrain(lineThreshold + hysteresis / 2, 0, 4095);
+}
+
+static bool isBlackHysteresis(int raw) {
+  bool black;
+
+  if (!lineInvert) {
+    if (!lineStateBlack) black = (raw <= thrLow);
+    else black = !(raw >= thrHigh);
+  } else {
+    if (!lineStateBlack) black = (raw >= thrHigh);
+    else black = !(raw <= thrLow);
+  }
+
+  lineStateBlack = black;
+  return black;
+}
+
+static float readDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, 25000UL);
+  if (dur == 0) return 999.0f;
+  return (float)dur / 58.2f;
+}
+
+static bool calibratedOK() {
+  return (whiteRef >= 0 && blackRef >= 0 && whiteRef != blackRef);
+}
+
+static void resetTrackingState() {
+  lineStateBlack = false;
+  lastTurnDir = 0;
+  lastSeenLineMs = millis();
+  lineLostStartMs = 0;
+  lastRecoveryFlipMs = 0;
+  recoveryDir = -1;
+}
+
+// ===================== DANCE =====================
+static void startDance() {
+  danceActive = true;
+  danceStartMs = millis();
+  danceStep = 0;
+  mode = MODE_DANCE;
+}
+
+static void runDance() {
+  if (!danceActive) return;
+
+  const unsigned long danceDurationMs = 30000;   // 30 seconds total
+  const unsigned long patternMs = 1700;          // one dance loop length
+  unsigned long t = millis() - danceStartMs;
+
+  if (t >= danceDurationMs) {
+    driveStop();
+    danceActive = false;
+    mode = MODE_MANUAL;
+    return;
+  }
+
+  unsigned long phase = t % patternMs;
+
+  if (phase < 220) {
+    driveForward(190);
+  } else if (phase < 440) {
+    driveBackward(190);
+  } else if (phase < 740) {
+    turnLeft(190);
+  } else if (phase < 1040) {
+    turnRight(190);
+  } else if (phase < 1260) {
+    driveForwardBiasLeft(210, 95);
+  } else if (phase < 1480) {
+    driveForwardBiasRight(210, 95);
+  } else {
+    driveBackward(170);
+  }
+}
+
+// ===================== UDP DANCE COMMANDS =====================
+static void handleUdpCommand(const String& cmd) {
+  if (cmd == "DANCE_ALL") {
+    startDance();
+    return;
+  }
+
+  if (cmd.startsWith("DANCE_")) {
+    int target = cmd.substring(6).toInt();
+    if (target == robotID) startDance();
+  }
+}
+
+static void pollUdp() {
+  int packetSize = udp.parsePacket();
+  if (!packetSize) return;
+
+  int len = udp.read(incomingPacket, sizeof(incomingPacket) - 1);
+  if (len < 0) return;
+  incomingPacket[len] = 0;
+
+  String cmd = String(incomingPacket);
+  cmd.trim();
+  handleUdpCommand(cmd);
+}
+
+// ===================== AUTO =====================
+static void autoObstacleAvoid() {
+  float d = readDistanceCm();
+
+  if (!avoiding) {
+    if (d <= obstacleStopCm) {
+      avoiding = true;
+      avoidMs = millis();
+      driveStop();
+    }
+    return;
+  }
+
+  unsigned long t = millis() - avoidMs;
+
+  if (t < 120) {
+    driveStop();
+    return;
+  }
+
+  if (t < 420) {
+    driveBackward(backSpeed);
+    return;
+  }
+
+  if (d >= obstacleClearCm) {
+    avoiding = false;
+    driveStop();
+    delay(40);
+    return;
+  }
+
+  if (((t / 700UL) % 2UL) == 0UL) turnLeft(turnSpeed);
+  else turnRight(turnSpeed);
+}
+
+static void autoLineFollowAndRecover() {
+  int raw = readLineRaw();
+  bool onBlack = isBlackHysteresis(raw);
+  unsigned long now = millis();
+
+  if (onBlack) {
+    lastSeenLineMs = now;
+    lineLostStartMs = 0;
+
+    // More aggressive analog steering for tighter curves.
+    int error = raw - lineThreshold;
+    int mag = abs(error);
+    int delta = map(constrain(mag, 0, 1500), 0, 1500, 20, 135);
+    int fast = constrain(baseSpeed + delta, 0, 255);
+    int slow = constrain(baseSpeed - delta - 15, 0, 255);
+
+    if (!lineInvert) {
+      // darker = smaller ADC value
+      if (error < -35) {
+        driveForwardBiasLeft(fast, slow);
+      } else if (error > 35) {
+        driveForwardBiasRight(fast, slow);
+      } else {
+        driveForward(baseSpeed);
+      }
+    } else {
+      if (error > 35) {
+        driveForwardBiasLeft(fast, slow);
+      } else if (error < -35) {
+        driveForwardBiasRight(fast, slow);
+      } else {
+        driveForward(baseSpeed);
+      }
+    }
+    return;
+  }
+
+  if (lineLostStartMs == 0) {
+    lineLostStartMs = now;
+    recoveryDir = (lastTurnDir == 0) ? -1 : lastTurnDir;
+    lastRecoveryFlipMs = now;
+  }
+
+  unsigned long lostFor = now - lineLostStartMs;
+
+  // Brief reverse first so the sensor can see the line again instead of driving deeper away.
+  if (lostFor < 90) {
+    driveBackward(backSpeed);
+    return;
+  }
+
+  // Then do a directional sweep. Start with last known direction, then alternate.
+  if (now - lastRecoveryFlipMs > 280) {
+    recoveryDir = -recoveryDir;
+    lastRecoveryFlipMs = now;
+  }
+
+  int sweep = searchSpeed;
+  if (lostFor > 900) sweep = constrain(searchSpeed + 20, 0, 255);
+  if (lostFor > 1800) sweep = constrain(searchSpeed + 35, 0, 255);
+
+  if (recoveryDir < 0) turnLeft(sweep);
+  else turnRight(sweep);
+}
+
+static void runAuto() {
+  if (!calibratedOK()) {
+    driveStop();
+    return;
+  }
+
+  autoObstacleAvoid();
+  if (avoiding) return;
+
+  autoLineFollowAndRecover();
+}
+
+// ===================== WEB UI =====================
+static String htmlPage() {
+  String s;
+  s.reserve(9000);
+
+  int lr = readLineRaw();
+  bool onB = isBlackHysteresis(lr);
+  float dc = readDistanceCm();
+
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<style>";
+  s += "body{font-family:system-ui;margin:16px;max-width:760px}";
+  s += "button{padding:14px 16px;margin:6px;font-size:16px}";
+  s += "input{width:320px}";
+  s += "code{background:#f1f1f1;padding:2px 6px;border-radius:4px}";
+  s += "</style></head><body>";
+
+  s += "<h2>ESP32 NOMAD Robot</h2>";
+
+  s += "<p><b>Mode:</b> ";
+  if (mode == MODE_AUTO) s += "AUTO";
+  else if (mode == MODE_DANCE) s += "DANCE";
+  else s += "MANUAL";
+  s += "</p>";
+
+  s += "<button onclick=\"fetch('/mode?set=auto').then(()=>location.reload())\">AUTO</button>";
+  s += "<button onclick=\"fetch('/mode?set=manual').then(()=>location.reload())\">MANUAL</button>";
+  s += "<button onclick=\"fetch('/dance').then(()=>location.reload())\">DANCE</button>";
+
+  s += "<h3>Joystick Drive</h3>";
+  s += "<p>Drag the blue stick. Center = stop. It works on phone and laptop.</p>";
+  s += "<div style='display:flex;flex-direction:column;align-items:center;gap:10px;user-select:none'>";
+  s += "<div id='joyWrap' style='width:240px;height:240px;border:2px solid #333;border-radius:50%;position:relative;touch-action:none;background:#f7f7f7'>";
+  s += "<div id='joyDot' style='width:72px;height:72px;border-radius:50%;background:#4da3ff;position:absolute;left:84px;top:84px;display:flex;align-items:center;justify-content:center;font-weight:700'>GO</div>";
+  s += "</div>";
+  s += "<div id='joyReadout'><b>X:</b> 0 <b>Y:</b> 0</div>";
+  s += "<button onclick=\"fetch('/drive?cmd=stop')\" style='width:120px;height:64px;font-weight:700'>Stop</button>";
+  s += "</div>";
+
+  s += "<h3>Backup D-Pad</h3>";
+  s += "<p>Press and hold a direction. Release to stop.</p>";
+  s += "<div style='display:inline-flex;flex-direction:column;align-items:center;gap:10px;user-select:none'>";
+  s += "<button class='hold' data-cmd='fwd' style='width:120px;height:64px'>Forward</button>";
+  s += "<div style='display:flex;align-items:center;justify-content:center;gap:10px'>";
+  s += "<button class='hold' data-cmd='left' style='width:120px;height:64px'>Left</button>";
+  s += "<button onclick=\"fetch('/drive?cmd=stop')\" style='width:120px;height:64px;font-weight:700'>Stop</button>";
+  s += "<button class='hold' data-cmd='right' style='width:120px;height:64px'>Right</button>";
+  s += "</div>";
+  s += "<button class='hold' data-cmd='back' style='width:120px;height:64px'>Back</button>";
+  s += "</div>";
+
+  s += "<h3>Line Calibration</h3>";
+  s += "<p><button onclick=\"fetch('/cal?step=white').then(()=>location.reload())\">Calibrate WHITE</button>";
+  s += "<button onclick=\"fetch('/cal?step=black').then(()=>location.reload())\">Calibrate BLACK</button></p>";
+  s += "<p><b>Saved:</b> WHITE=" + String(whiteRef) + " | BLACK=" + String(blackRef) +
+       " | Threshold=" + String(lineThreshold) + "</p>";
+
+  if (!calibratedOK()) {
+    s += "<p style='color:red'><b>WARNING:</b> Calibrate WHITE and BLACK before AUTO will move.</p>";
+  }
+
+  s += "<p>Invert: " + String(lineInvert ? "ON" : "OFF");
+  s += " <button onclick=\"fetch('/set?invert=toggle').then(()=>location.reload())\">Toggle</button></p>";
+
+  s += "<h3>Settings</h3>";
+
+  s += "<p>Base speed: <span id='bs'></span></p>";
+  s += "<input type='range' min='0' max='255' value='" + String(baseSpeed) + "' ";
+  s += "oninput=\"bs.innerText=this.value\" onchange=\"fetch('/set?base='+this.value)\">";
+  s += "<script>bs.innerText=" + String(baseSpeed) + ";</script>";
+
+  s += "<p>Turn/Search speed: <span id='ts'></span></p>";
+  s += "<input type='range' min='0' max='255' value='" + String(turnSpeed) + "' ";
+  s += "oninput=\"ts.innerText=this.value\" onchange=\"fetch('/set?turn='+this.value)\">";
+  s += "<script>ts.innerText=" + String(turnSpeed) + ";</script>";
+
+  s += "<p>Back speed: <span id='bks'></span></p>";
+  s += "<input type='range' min='0' max='255' value='" + String(backSpeed) + "' ";
+  s += "oninput=\"bks.innerText=this.value\" onchange=\"fetch('/set?back='+this.value)\">";
+  s += "<script>bks.innerText=" + String(backSpeed) + ";</script>";
+
+  s += "<p>Left Motor Trim: <span id='ltm'></span></p>";
+  s += "<input type='range' min='-80' max='80' value='" + String(leftTrim) + "' ";
+  s += "oninput=\"ltm.innerText=this.value\" onchange=\"fetch('/set?ltrim='+this.value)\">";
+  s += "<script>ltm.innerText=" + String(leftTrim) + ";</script>";
+
+  s += "<p>Right Motor Trim: <span id='rtm'></span></p>";
+  s += "<input type='range' min='-80' max='80' value='" + String(rightTrim) + "' ";
+  s += "oninput=\"rtm.innerText=this.value\" onchange=\"fetch('/set?rtrim='+this.value)\">";
+  s += "<script>rtm.innerText=" + String(rightTrim) + ";</script>";
+
+  s += "<p>Hysteresis: <span id='hy'></span></p>";
+  s += "<input type='range' min='20' max='800' value='" + String(hysteresis) + "' ";
+  s += "oninput=\"hy.innerText=this.value\" onchange=\"fetch('/set?hys='+this.value)\">";
+  s += "<script>hy.innerText=" + String(hysteresis) + ";</script>";
+
+  s += "<p>Line threshold: <span id='lt'></span></p>";
+  s += "<input type='range' min='0' max='4095' value='" + String(lineThreshold) + "' ";
+  s += "oninput=\"lt.innerText=this.value\" onchange=\"fetch('/set?line='+this.value)\">";
+  s += "<script>lt.innerText=" + String(lineThreshold) + ";</script>";
+
+  s += "<p>Obstacle stop (cm): <span id='os'></span></p>";
+  s += "<input type='range' min='5' max='80' value='" + String(obstacleStopCm) + "' ";
+  s += "oninput=\"os.innerText=this.value\" onchange=\"fetch('/set?obs='+this.value)\">";
+  s += "<script>os.innerText=" + String(obstacleStopCm) + ";</script>";
+
+  s += "<h3>Live Readings</h3>";
+  s += "<p>Line ADC: " + String(lr) + " | Black? " + String(onB ? "YES" : "NO") + "</p>";
+  s += "<p>thrLow=" + String(thrLow) + " thrHigh=" + String(thrHigh) + "</p>";
+  s += "<p>Distance: " + String(dc, 1) + " cm</p>";
+
+  s += "<h3>Wi-Fi</h3>";
+  s += "<p><b>AP:</b> <code>" + String(AP_SSID) + "</code> pass <code>" + String(AP_PASS) + "</code><br>";
+  s += "Open <code>192.168.4.1</code> for the robot web page.</p>";
+  s += "<p><b>STA target:</b> <code>" + String(STA_SSID) + "</code><br>";
+  s += "STA IP: <code>" + WiFi.localIP().toString() + "</code><br>";
+  s += "UDP port: <code>" + String(UDP_PORT) + "</code> | Robot ID: <code>" + String(robotID) + "</code></p>";
+
+  s += "<script>";
+  s += "const stopRobot=()=>fetch('/drive?cmd=stop').catch(()=>{});";
+  s += "document.querySelectorAll('.hold').forEach(b=>{";
+  s += "const go=()=>fetch('/drive?cmd='+b.dataset.cmd).catch(()=>{});";
+  s += "b.addEventListener('mousedown',go);b.addEventListener('touchstart',go,{passive:true});";
+  s += "['mouseup','mouseleave','touchend','touchcancel'].forEach(ev=>b.addEventListener(ev,stopRobot));";
+  s += "});";
+  s += "document.addEventListener('mouseup',stopRobot);document.addEventListener('touchend',stopRobot,{passive:true});";
+  s += "document.addEventListener('keydown',e=>{if(e.repeat)return;const k=e.key.toLowerCase();if(k==='arrowup'||k==='w')fetch('/drive?cmd=fwd');if(k==='arrowdown'||k==='s')fetch('/drive?cmd=back');if(k==='arrowleft'||k==='a')fetch('/drive?cmd=left');if(k==='arrowright'||k==='d')fetch('/drive?cmd=right');if(k===' ')fetch('/drive?cmd=stop');});";
+  s += "document.addEventListener('keyup',e=>{const k=e.key.toLowerCase();if(['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d',' '].includes(k))stopRobot();});";
+  s += "const joyWrap=document.getElementById('joyWrap');const joyDot=document.getElementById('joyDot');const joyReadout=document.getElementById('joyReadout');let joyActive=false;let joyTimer=null;let joyX=0;let joyY=0;";
+  s += "function sendJoy(){fetch('/joy?x='+joyX+'&y='+joyY).catch(()=>{});}";
+  s += "function clamp(v,min,max){return Math.max(min,Math.min(max,v));}";
+  s += "function setJoyVisual(x,y){joyX=x;joyY=y;joyDot.style.left=(84+Math.round(x*0.84))+'px';joyDot.style.top=(84-Math.round(y*0.84))+'px';joyReadout.innerHTML='<b>X:</b> '+x+' <b>Y:</b> '+y;}";
+  s += "function updateJoy(clientX,clientY){const r=joyWrap.getBoundingClientRect();const cx=r.left+r.width/2;const cy=r.top+r.height/2;let dx=clientX-cx;let dy=cy-clientY;const maxR=84;const mag=Math.hypot(dx,dy);if(mag>maxR){dx=dx*maxR/mag;dy=dy*maxR/mag;}const x=Math.round(clamp(dx/maxR,-1,1)*100);const y=Math.round(clamp(dy/maxR,-1,1)*100);setJoyVisual(x,y);if(!joyTimer){sendJoy();joyTimer=setInterval(sendJoy,120);}}";
+  s += "function releaseJoy(){joyActive=false;if(joyTimer){clearInterval(joyTimer);joyTimer=null;}setJoyVisual(0,0);sendJoy();}";
+  s += "joyWrap.addEventListener('pointerdown',e=>{joyActive=true;joyWrap.setPointerCapture(e.pointerId);updateJoy(e.clientX,e.clientY);});";
+  s += "joyWrap.addEventListener('pointermove',e=>{if(joyActive)updateJoy(e.clientX,e.clientY);});";
+  s += "joyWrap.addEventListener('pointerup',releaseJoy);joyWrap.addEventListener('pointercancel',releaseJoy);";
+  s += "setJoyVisual(0,0);";
+  s += "</script>";
+
+  s += "</body></html>";
+  return s;
+}
+
+
+static inline int signedToDir(int v) {
+  if (v > 0) return +1;
+  if (v < 0) return -1;
+  return 0;
+}
+
+static void driveTank(int leftCmd, int rightCmd) {
+  leftCmd = constrain(leftCmd, -255, 255);
+  rightCmd = constrain(rightCmd, -255, 255);
+
+  int leftDir = signedToDir(leftCmd) * LEFT_FWD_DIR;
+  int rightDir = signedToDir(rightCmd) * RIGHT_FWD_DIR;
+
+  setMotorLeft(leftDir, abs(leftCmd));
+  setMotorRight(rightDir, abs(rightCmd));
+}
+
+static void handleJoyDrive(int x, int y) {
+  // x: left/right  (-100..100)
+  // y: forward/back (-100..100), positive means forward from the web UI
+  x = constrain(x, -100, 100);
+  y = constrain(y, -100, 100);
+
+  // Arcade drive mix
+  int leftMix = y + x;
+  int rightMix = y - x;
+
+  leftMix = constrain(leftMix, -100, 100);
+  rightMix = constrain(rightMix, -100, 100);
+
+  int maxForward = baseSpeed;
+  int maxBackward = backSpeed;
+
+  int leftCmd = (leftMix >= 0) ? map(leftMix, 0, 100, 0, maxForward)
+                               : -map(-leftMix, 0, 100, 0, maxBackward);
+  int rightCmd = (rightMix >= 0) ? map(rightMix, 0, 100, 0, maxForward)
+                                 : -map(-rightMix, 0, 100, 0, maxBackward);
+
+  driveTank(leftCmd, rightCmd);
+}
+
+// ===================== ROUTES =====================
+static void handleRoot() {
+  server.send(200, "text/html", htmlPage());
+}
+
+static void handleMode() {
+  if (server.hasArg("set")) {
+    String m = server.arg("set");
+    if (m == "auto") {
+      mode = MODE_AUTO;
+      danceActive = false;
+    }
+    if (m == "manual") {
+      mode = MODE_MANUAL;
+      danceActive = false;
+      driveStop();
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleDrive() {
+  if (mode == MODE_AUTO || mode == MODE_DANCE) {
+    server.send(403, "text/plain", "Switch to MANUAL first.");
+    return;
+  }
+
+  String cmd = server.arg("cmd");
+
+  if (cmd == "fwd") driveForward(baseSpeed);
+  else if (cmd == "back") driveBackward(backSpeed);
+  else if (cmd == "left") turnLeft(turnSpeed);
+  else if (cmd == "right") turnRight(turnSpeed);
+  else driveStop();
+
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleJoy() {
+  if (mode == MODE_AUTO || mode == MODE_DANCE) {
+    server.send(403, "text/plain", "Switch to MANUAL first.");
+    return;
+  }
+
+  int x = server.hasArg("x") ? server.arg("x").toInt() : 0;
+  int y = server.hasArg("y") ? server.arg("y").toInt() : 0;
+  handleJoyDrive(x, y);
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleSet() {
+  if (server.hasArg("base"))  baseSpeed = constrain(server.arg("base").toInt(), 0, 255);
+  if (server.hasArg("turn")) {
+    turnSpeed = constrain(server.arg("turn").toInt(), 0, 255);
+    searchSpeed = turnSpeed;
+  }
+  if (server.hasArg("back"))  backSpeed = constrain(server.arg("back").toInt(), 0, 255);
+  if (server.hasArg("line"))  lineThreshold = constrain(server.arg("line").toInt(), 0, 4095);
+  if (server.hasArg("obs"))   obstacleStopCm = constrain(server.arg("obs").toInt(), 5, 150);
+  if (server.hasArg("hys"))   hysteresis = constrain(server.arg("hys").toInt(), 20, 2000);
+  if (server.hasArg("ltrim")) leftTrim = constrain(server.arg("ltrim").toInt(), -80, 80);
+  if (server.hasArg("rtrim")) rightTrim = constrain(server.arg("rtrim").toInt(), -80, 80);
+
+  if (server.hasArg("invert") && server.arg("invert") == "toggle") lineInvert = !lineInvert;
+
+  updateThresholds();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleCal() {
+  if (!server.hasArg("step")) {
+    server.send(400, "text/plain", "Missing step");
+    return;
+  }
+
+  String step = server.arg("step");
+  driveStop();
+  delay(120);
+
+  int v = sampleLineADC(100, 3);
+
+  if (step == "white") whiteRef = v;
+  else if (step == "black") blackRef = v;
+  else {
+    server.send(400, "text/plain", "Invalid step");
+    return;
+  }
+
+  if (whiteRef >= 0 && blackRef >= 0) {
+    lineInvert = (blackRef > whiteRef);
+    lineThreshold = (whiteRef + blackRef) / 2;
+    updateThresholds();
+    resetTrackingState();
+  }
+
+  server.send(200, "text/plain",
+              String("OK ") + step + "=" + v +
+              " white=" + whiteRef +
+              " black=" + blackRef +
+              " thr=" + lineThreshold +
+              " invert=" + (lineInvert ? "1" : "0") +
+              " low=" + thrLow +
+              " high=" + thrHigh);
+}
+
+static void handleDance() {
+  startDance();
+  server.send(200, "text/plain", "DANCING");
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_RMOTOR_1A, OUTPUT);
+  pinMode(PIN_RMOTOR_2A, OUTPUT);
+  pinMode(PIN_LMOTOR_3A, OUTPUT);
+  pinMode(PIN_LMOTOR_4A, OUTPUT);
+  pinMode(PIN_RPWM_EN, OUTPUT);
+  pinMode(PIN_LPWM_EN, OUTPUT);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  driveStop();
+  analogReadResolution(12);
+  updateThresholds();
+  resetTrackingState();
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  WiFi.begin(STA_SSID, STA_PASS);
+  Serial.print("Connecting to STA WiFi");
+  unsigned long staStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - staStart < 15000UL) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("STA connected. IP: ");
+    Serial.println(WiFi.localIP());
+    udp.begin(UDP_PORT);
+    Serial.print("UDP listening on ");
+    Serial.println(UDP_PORT);
+  } else {
+    Serial.println("STA connect timeout. AP mode still available.");
+    udp.begin(UDP_PORT);
+  }
+
+  server.on("/", handleRoot);
+  server.on("/mode", handleMode);
+  server.on("/drive", handleDrive);
+  server.on("/joy", handleJoy);
+  server.on("/set", handleSet);
+  server.on("/cal", handleCal);
+  server.on("/dance", handleDance);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  pollUdp();
+
+  if (danceActive || mode == MODE_DANCE) {
+    runDance();
+    return;
+  }
+
+  if (mode == MODE_AUTO) {
+    runAuto();
+  }
+}
